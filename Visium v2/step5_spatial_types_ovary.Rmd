@@ -1,0 +1,191 @@
+```{r}
+{
+library(CellChat)
+library(Seurat)
+}
+load("./data/stRNA_stolist_reduction.Rdata")
+FeaturePlot(stRNA,features = c("Enpp2"),split.by = "orig.ident")
+```
+
+
+```{r}
+set.seed(521)
+stRNA = RunTSNE(stRNA)
+DimPlot(stRNA,reduction ="tsne" )
+```
+
+```{r}
+#  Need to look at the picture, determine the cell subsets:
+celltype=data.frame(ClusterID=0:9,
+                    celltype='unkown')
+celltype[celltype$ClusterID %in% c(0),2]='Follicle' 
+celltype[celltype$ClusterID %in% c(1),2]='Oviduct'
+celltype[celltype$ClusterID %in% c(2),2]='Atretic'
+celltype[celltype$ClusterID %in% c(3,5),2]='Antral'
+celltype[celltype$ClusterID %in% c(4,9),2]='CL'
+celltype[celltype$ClusterID %in% c(6),2]='stromal'
+celltype[celltype$ClusterID %in% c(7),2]='Oocyte' 
+celltype[celltype$ClusterID %in% c(8),2]='Epithelium' 
+
+table(celltype$celltype)
+```
+
+
+```{r}
+new.cluster.ids <- celltype$celltype
+names(new.cluster.ids) <- levels(stRNA)
+stRNA <- RenameIdents(stRNA, new.cluster.ids)
+table(stRNA@active.ident)
+```
+
+```{r}
+DimPlot(stRNA)
+```
+
+```{r}
+stRNA@meta.data$stage = stRNA@active.ident
+table(stRNA@meta.data$stage)
+```
+```{r}
+#tsne非线性降维
+stRNA <- RunTSNE(stRNA, dims =  1:30) 
+```
+
+
+```{r}
+save(stRNA,file = "./data/stRNA_annotation.Rdata")
+```
+
+
+```{r}
+rm(list = ls())
+gc()
+load("./data/stRNA_annotation.Rdata")
+```
+```{r}
+mycolor = c(   '#A499CC',              
+                   "#C4C3BE",
+                   "#DFA0A6",
+                   "#98B3D9",
+                   "#E4BE92",
+                   "#CB6B7A",
+                   "#D5CBDA",
+                   "#f1707d", 
+                   "#f15536",
+                   "#ae716e"
+                   
+)
+```
+
+```{r}
+names(mycolor) = c(0:9)
+```
+
+
+
+
+```{r}
+p = SpatialDimPlot(stRNA, label = F, repel=F, label.size = 2,group.by = "opt_clust",cols = mycolor)
+# + plot_layout(guides = "collect")
+p
+ggsave("./figure/Cluster/opt_0.7_ovary_cluster.pdf", p, width = 8, height = 5)
+```
+
+```{r}
+# pulled from the Seurat source code--requires package RColorBrewer
+SpatialColors <- colorRampPalette(colors = rev(x = brewer.pal(n = 11, name = "Spectral")))
+
+SpatialFeaturePlot(object, features = c("Celltype_1_proportion")) &
+scale_fill_gradientn(limits=c(0, 1), colours=SpatialColors(n=100))
+```
+
+
+```{r}
+p = SpatialFeaturePlot(stRNA, features = "Gpnmb",)
+p
+ggsave("./figure/markers/spatial_expr_Gpnmb.pdf", p, width = 8, height = 5)
+```
+```{r}
+p = SpatialFeaturePlot(stRNA, features = "Cd68")
+p
+ggsave("./figure/markers/spatial_expr_Cd68.pdf", p, width = 8, height = 5)
+```
+
+
+```{r}
+mycolor = c(                 
+                   "#C4C3BE",
+                   "#DFA0A6",
+                   "#98B3D9",
+                   "#E4BE92",
+                   "#CB6B7A",
+                   "#D5CBDA",
+                   "#f1707d", 
+                   "#f15536",
+                   "#ae716e"
+                   
+)
+
+final_embedding <- DimPlot(stRNA, group.by = "stage",cols = mycolor,reduction = "tsne") +
+  ggtitle(paste0("spots ",
+                 ncol(stRNA)))
+
+final_embedding
+ggsave("./figure/Cluster/tsne_ovary_type.pdf", final_embedding, width = 6, height = 5)
+```
+
+```{r}
+{
+  table(stRNA$orig.ident)
+  # CTR Lip 
+  # 379 382
+  
+  
+  prop.table(table(Idents(stRNA)))
+  table(Idents(stRNA), stRNA$orig.ident)
+  
+  
+  Cellratio <- prop.table(table(Idents(stRNA), stRNA$SectionID), margin = 2)#计算各组样本不同细胞群比例
+  Cellratio <- as.data.frame(Cellratio)
+  write.csv(Cellratio,"files/Cellration_stRNA_type.csv")
+  
+  # allcolour=c("#00468B","#925E9F","#759EDD","#0099B4","#76D1B1","#42B540","#B8D24D",
+  #             "#EDE447","#FAB158","#FF7777","#FD0000","#AD002A","#AE8691","#CE9573",
+  #             "#756455")
+  allcolour = mycolor
+  library(ggplot2)
+  p6 <- ggplot(Cellratio) + 
+    geom_bar(aes(x =Var2, y= Freq, fill = Var1),stat = "identity",width = 0.7,size = 0.5,colour = '#222222')+ 
+    theme_classic() +
+    labs(x='Sample',y = 'Ratio')+
+    scale_fill_manual(values = mycolor)+
+    theme(panel.border = element_rect(fill=NA,color="black", size=0.3, linetype="solid"))
+  p6
+  ggsave("figure/Cluster/proportional_bar_CTR1_LIP2.pdf", p6, width = 6, height = 6)
+```
+
+```{r}
+source("utools.R")
+p = CellRatioPlot(object = stRNA,
+                  sample.name = "SectionID",
+                  celltype.name = "stage",
+                  fill.col = allcolour)
+ggsave(p,filename=paste0("figure/Cluster/proportional_bar_CTR_LIP.pdf"),width = 5,height = 6)
+```
+
+
+
+```{r}
+p <- VlnPlot(stRNA,features=c("nFeature_Spatial","nCount_Spatial","percent.mt"),ncol=3)
+  p
+  ggsave("总的Lip组—nFeature—nCount-percent.mt.pdf", p, width = 14, height = 7)
+  plot1 <- FeatureScatter(stRNA,feature1 = "nCount_Spatial",feature2 = "percent.mt")
+  plot2 <- FeatureScatter(stRNA,feature1 = "nCount_Spatial",feature2 = "nFeature_Spatial")
+  p3 <- plot1/plot2
+  ggsave("Lip组—nFeature—nCount-percent.mt-散点图.pdf", p3, width = 7, height = 14)
+  
+  
+  
+}
+```
+

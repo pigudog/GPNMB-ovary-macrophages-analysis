@@ -1,0 +1,722 @@
+# 1. Data preprocessing
+## 1.1 load data
+```{r}
+### load packages
+{
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(ggplot2)
+library(tidydr)
+}
+
+rm(list = ls())
+gc()
+
+options(future.globals.maxSize = 20 * 1024^3) # Set the maximum size limit for global variables to 20GB
+```
+
+
+Create a Seurat spatial transcriptome object 
+```{r}
+# dir()
+SectionID = c('CTR','LIP')
+DataDir = c('~/spatial/raw_data/project/CTR/', '~/spatial/raw_data/project/LIP/')
+stolist = list()
+for(i in seq_along(SectionID)){
+  # load data with the function Load10X_Spatial()
+  sto <- Load10X_Spatial(data.dir = DataDir[i], slice = SectionID[i])
+  # spot renaming: prevents warning of duplicated barcodes, but the precess can also be done without it
+  sto <- RenameCells(sto, add.cell.id = SectionID[i])
+  # Add slice ID
+  sto$SectionID <- SectionID[i]
+  # This is only for observation and not for subset()
+  # Calculate the proportion of mitochondrial genes in cells, Please note whether the samples used are human or mouse
+  sto[["percent.mt"]] <- PercentageFeatureSet(sto, pattern = "^(MT|mt|Mt)-") #该格式为人鼠通用
+  # Calculate the proportion of ribosomal genes in cells
+  sto[["percent.rb"]] <- PercentageFeatureSet(sto, pattern = "^Rp[sl]")
+  stolist[[SectionID[i]]] <- sto
+}
+```
+
+Save the loaded raw data
+```{r}
+# dir.create("./data")
+save(stolist,file = "./data/stolist_raw.rda")
+rm(list = ls())
+gc()
+```
+## 1.2 qc： Data quality control
+```{r}
+load("./data/stolist_raw.rda")
+table(stolist$CTR$orig.ident)
+```
+
+
+```{r}
+table(stolist$LIP$orig.ident)
+```
+
+
+```{r}
+# ### Draw a quality control violin diagram
+# lapply(c("QC","Data","Cluster_Bayes","Cluster_Louvain","Deconvolution","Function","stLearn","SVGs"),
+#        function(x){if(!file.exists(x)) dir.create(file.path( "figure/",x ))})
+
+
+dir_selected = file.path("figure", "QC")
+if(T){
+  ### Indicators before quality control
+  # counts
+  p.list <- lapply(stolist, function(x){
+    p1 <- VlnPlot(x, features = "nCount_Spatial") + ggtitle(unique(x$SectionID)) +
+      theme(legend.position = "none", axis.text.x = element_blank())
+    p2 <- SpatialFeaturePlot(x, features = "nCount_Spatial") + theme(legend.position = "right")
+    p <- p1|p2
+    p
+  })
+  p <- wrap_plots(p.list, ncol = 1)
+  ggsave(file.path(dir_selected,"nCount_Spatial_before.pdf"), p, width = 10, height = 9)
+  # features
+  p.list <- lapply(stolist, function(x){
+    p1 <- VlnPlot(x, features = "nFeature_Spatial") + ggtitle(unique(x$SectionID)) +
+      theme(legend.position = "none", axis.text.x = element_blank())
+    p2 <- SpatialFeaturePlot(x, features = "nFeature_Spatial") + theme(legend.position = "right")
+    p <- p1|p2
+    p
+  })
+  p <- wrap_plots(p.list, ncol = 1)
+  ggsave(file.path(dir_selected,"nFeature_Spatial_before.pdf"), p, width = 10, height = 9)
+  # mitochondrial genes
+  p.list <- lapply(stolist, function(x){
+    p1 <- VlnPlot(x, features = "percent.mt") + ggtitle(unique(x$SectionID)) +
+      theme(legend.position = "none", axis.text.x = element_blank())
+    p2 <- SpatialFeaturePlot(x, features = "percent.mt") + theme(legend.position = "right")
+    p <- p1|p2
+    p
+  })
+  p <- wrap_plots(p.list, ncol = 1)
+  ggsave(file.path(dir_selected,"percent_mt_before.pdf"), p, width = 10, height = 9)  
+  # ribosome gene
+  p.list <- lapply(stolist, function(x){
+    p1 <- VlnPlot(x, features = "percent.rb") + ggtitle(unique(x$SectionID)) +
+      theme(legend.position = "none", axis.text.x = element_blank())
+    p2 <- SpatialFeaturePlot(x, features = "percent.rb") + theme(legend.position = "right")
+    p <- p1|p2
+    p
+  })
+  p <- wrap_plots(p.list, ncol = 1)
+  ggsave(file.path(dir_selected,"percent_rb_before.pdf"), p, width = 10, height = 9)  
+}
+```
+
+
+```{r}
+# Process the data, After filtering  ------------------------------------------------
+print("before:")
+for (i in stolist){
+  
+  print(dim(i))
+}
+```
+```{r}
+### QC for the Scattered points
+minCount = 1500
+minFeature = 500
+maxmt = 15  ##In the gene symbol, people's mitochondria start with MT- and mice's with mt-
+stolist <- lapply(stolist, function(x){
+  subset(x, nCount_Spatial>minCount&nFeature_Spatial>minFeature&percent.mt<maxmt)
+})
+```
+
+
+```{r}
+# Exclude MT and ribosomal genes ------------------------------------------------------
+SectionID = c('CTR','LIP')
+for(i in seq_along(SectionID)){
+  sample_seurat <- stolist[[SectionID[i]]]
+  coldata <- GetTissueCoordinates(sample_seurat,
+                                cols = c("row", "col", "tissue"),
+                                scale = NULL)
+
+  sample_seurat$tissue <- coldata[rownames(sample_seurat@meta.data), "tissue"]
+  
+  sample_seurat$tissue <- ifelse(sample_seurat$tissue == 1, 
+                                 "on_tissue", 
+                                 "not_on_tissue")
+
+  # Ribosomal and mitochondrial genes are taken out. 
+  # please note the differences between mouse and human genes, such as RPS and Rps
+  mt_genes <- row.names(sample_seurat)[grepl("^(MT|mt|Mt)-", row.names(sample_seurat))]
+  rps_genes <- row.names(sample_seurat)[grepl("^Rps", row.names(sample_seurat))]
+  mrp_genes <- row.names(sample_seurat)[grepl("^Mrp", row.names(sample_seurat))]
+  rpl_genes <- row.names(sample_seurat)[grepl("^Rpl", row.names(sample_seurat))]
+  rb_genes <- c(rps_genes, mrp_genes, rpl_genes)
+  
+  
+  ## Delete genes but not cells! Or spots will be lost a lot 
+  sample_seurat <- sample_seurat[!rownames(sample_seurat) %in% c(rb_genes, mt_genes), ]
+  
+  #Genes expressed in less that 10 spots are filtered. 
+  # due to  the particularity of the sample, we use the parameter = 5
+  sample_seurat <- sample_seurat[rowSums(GetAssayData(sample_seurat, assay = "Spatial") > 0) > 5, ]
+  
+  # Then re-calculate the number of genes and reads per spot
+  sample_seurat$nFeature_Spatial_filt <- colSums(GetAssayData(sample_seurat, assay = "Spatial") > 0)
+  sample_seurat$nCount_Spatial_filt <- colSums(GetAssayData(sample_seurat, assay = "Spatial"))
+  
+  # reassignment
+  sample_seurat[["percent.mt"]] <- PercentageFeatureSet(sample_seurat, 
+                                                           pattern = "^mt-")
+  sample_seurat[["percent.rb"]] <- PercentageFeatureSet(sample_seurat, 
+                                                           pattern = "^Rp[sl]")
+  stolist[[SectionID[i]]] <- sample_seurat
+}
+```
+
+
+
+
+```{r}
+print("after:")
+for (i in stolist){
+  print(dim(i))
+}
+```
+
+
+```{r}
+if(T){
+  
+  ### Indicators after quality control
+  # counts
+  p.list <- lapply(stolist, function(x){
+    p1 <- VlnPlot(x, features = "nCount_Spatial_filt") + ggtitle(unique(x$SectionID)) +
+      theme(legend.position = "none", axis.text.x = element_blank())
+    p2 <- SpatialFeaturePlot(x, features = "nCount_Spatial_filt") + theme(legend.position = "right")
+    p <- p1|p2
+    p
+  })
+  p <- wrap_plots(p.list, ncol = 1)
+  ggsave(file.path(dir_selected,"nCount_Spatial_after.pdf"), p, width = 10, height = 9)
+  # faetures
+  p.list <- lapply(stolist, function(x){
+    p1 <- VlnPlot(x, features = "nFeature_Spatial_filt") + ggtitle(unique(x$SectionID)) +
+      theme(legend.position = "none", axis.text.x = element_blank())
+    p2 <- SpatialFeaturePlot(x, features = "nFeature_Spatial_filt") + theme(legend.position = "right")
+    p <- p1|p2
+    p
+  })
+  p <- wrap_plots(p.list, ncol = 1)
+  ggsave(file.path(dir_selected,"nFeature_Spatial_after.pdf"), p, width = 10, height = 9)
+  # mitochondrial genes
+  p.list <- lapply(stolist, function(x){
+    p1 <- VlnPlot(x, features = "percent.mt") + ggtitle(unique(x$SectionID)) +
+      theme(legend.position = "none", axis.text.x = element_blank())
+    p2 <- SpatialFeaturePlot(x, features = "percent.mt") + theme(legend.position = "right")
+    p <- p1|p2
+    p
+  })
+  p <- wrap_plots(p.list, ncol = 1)
+  ggsave(file.path(dir_selected,"percent_mt_after.pdf"), p, width = 10, height = 9)
+  # ribosome genes
+  p.list <- lapply(stolist, function(x){
+    p1 <- VlnPlot(x, features = "percent.rb") + ggtitle(unique(x$SectionID)) +
+      theme(legend.position = "none", axis.text.x = element_blank())
+    p2 <- SpatialFeaturePlot(x, features = "percent.rb") + theme(legend.position = "right")
+    p <- p1|p2
+    p
+  })
+  p <- wrap_plots(p.list, ncol = 1)
+  ggsave(file.path(dir_selected,"percent_rb_after.pdf"), p, width = 10, height = 9)  
+}  
+```
+
+End of quality control
+
+## 1.2 Standardization and normalization, dimensionality reduction clustering
+```{r}
+####orig.ident -> CTR&LIP
+stolist[[1]]$orig.ident <- "CTR"
+stolist[[2]]$orig.ident <- "Lip"
+table(stolist$CTR$orig.ident)
+```
+
+
+```{r}
+table(stolist$LIP$orig.ident)
+```
+
+
+```{r}
+stRNA <- merge(stolist[[1]], stolist[[2]])
+table(stRNA$orig.ident)
+```
+
+
+dimension reduction
+```{r}
+set.seed(1314)
+# SCT transform normalization ---------------------------------------------------------
+stRNA<- SCTransform(stRNA,
+                    assay = "Spatial",
+                    verbose = FALSE)
+stRNA <- NormalizeData(stRNA,
+                       normalization.method = 'LogNormalize',
+                       scale.factor = 10000,
+                       verbose = FALSE)
+
+# dimensionality reduction --------------------------------------------------
+DefaultAssay(stRNA) <- "SCT"
+
+stRNA <- ScaleData(stRNA, 
+                   verbose = FALSE, 
+                   features = rownames(stRNA)) %>%
+  RunPCA() %>%
+  RunUMAP(reduction = 'pca', dims = 1:30, verbose = FALSE)
+```
+
+```{r}
+# Optimize clustering --------------------------------------------------------------------
+print("Optimizing clustering")
+
+stRNA <- FindNeighbors(stRNA, reduction = "pca", dims = 1:30)
+
+seq_res <- seq(0.5, 1.5, 0.1)
+
+stRNA <- FindClusters(stRNA, 
+                      resolution = seq_res,
+                      verbose = F)
+
+# Optimize ---------------------------------------------------------------------------------
+
+cell_dists <- dist(stRNA@reductions$pca@cell.embeddings,
+                   method = "euclidean")
+
+cluster_info <- stRNA@meta.data[,grepl(paste0(DefaultAssay(stRNA), "_snn_res"),
+                                               colnames(stRNA@meta.data))] %>%
+  dplyr::mutate_all(as.character) %>%
+  dplyr::mutate_all(as.numeric)
+
+
+library(cluster)
+# Cluster evaluation index (Silhouette coefficient)
+silhouette_res <- apply(cluster_info, 2, function(x){
+  si <- silhouette(x, cell_dists)
+  mean(si[, 'sil_width'])
+})
+silhouette_res
+```
+
+```{r}
+optm_res <- names(which.max(silhouette_res))
+stRNA[["opt_clust"]] <- stRNA[[optm_res]]
+
+# Reduce meta-data,automatically -------------------------------------------------------------------------
+spam_cols <- grepl(paste0(DefaultAssay(stRNA), "_snn_res"),
+                   colnames(stRNA@meta.data)) |
+  grepl("seurat_clusters",colnames(stRNA@meta.data))
+
+stRNA@meta.data <- stRNA@meta.data[,!spam_cols]
+
+# Plot final cluster resolution --------------------------------------------------------------------
+mycolor = c("#A0C2E7",
+                   "#6894B9",
+                   "#8798A6",
+                   "#E0D9E0",
+                   "#EDBAA7",
+                   "#FADB7F",
+                   "#F3B646",
+                   "#EF9749",
+                   "#B27466",
+                   "#646F3F",
+                   "#899678",
+                   "#C2BC9A",
+                   "#868A63",
+                   "#C4C3BE",
+                   "#DFA0A6",
+                   "#98B3D9",
+                   "#E4BE92",
+                   "#CB6B7A",
+                   "#D5CBDA",
+                   "#f1707d", # 马卡龙草莓奶霜
+                   "#f15536",
+                   "#ef5767",
+                   "#ae716e",
+                   "#cb8e85",
+                   "#cf8878",
+                   "#c86f67",
+                   "#f1ccb8",
+                   "#f2debd",
+                   "#b8d38f",
+                   "#ddff95",
+                   "#ff9b6a",
+                   "#f1b8f1",
+                   "#d9b8f1",
+                   "#f1ccb8",
+                   "#f1f1b8",
+                   "#b8f1ed",
+                   "#e7dbca",
+                   "#e26538",
+                   "#f3d751",
+                   "#fd803a",
+                   "#fe997b",
+                   "#c490a0"
+)
+optm_res = "0.7"
+final_embedding <- DimPlot(stRNA, group.by = "opt_clust",cols = mycolor[15:40]) +
+  ggtitle(paste0("n spots ",
+                 ncol(sample_seurat),
+                 " ",
+                 optm_res))
+
+final_embedding
+```
+
+
+```{r}
+Idents(stRNA) = stRNA$opt_clust# should be seurat clusters.
+colors = mycolor[15:25]
+# The colors, which is a character vector of different color codes, need the names for the vector.
+names(colors) <- Idents(stRNA) %>% levels()
+
+p1 <- SpatialDimPlot(
+  stRNA, # the seurat object here contain only one sample, though it can contain more samples.
+  images = "CTR",
+  group.by = c("opt_clust"),
+  pt.size.factor = 1.15,
+  label = TRUE,
+  label.size = 2,
+  repel = TRUE,
+  combine = FALSE,
+  cols = colors
+)
+p1
+```
+
+```{r}
+spatial_embedding <- SpatialDimPlot(
+  stRNA, # the seurat object here contain only one sample, though it can contain more samples.
+  images = "LIP",
+  group.by = c("opt_clust"),
+  pt.size.factor = 1.15,
+  label = TRUE,
+  label.size = 6,
+  repel = TRUE,
+  combine = FALSE,
+  cols = colors
+)
+spatial_embedding
+```
+```{r}
+DimPlot(stRNA, group.by = "orig.ident", reduction = "umap")
+```
+
+
+```{r}
+p1 <- DimPlot(stRNA, reduction = "umap", label = TRUE)
+p2 <- SpatialDimPlot(stRNA, label = FALSE, label.size = 3,images = "CTR")
+p3 <- SpatialDimPlot(stRNA, label = FALSE, label.size = 3,images = "LIP")
+p <- p1 + p2+p3
+ggsave("./figure/Cluster_Louvain/SpatialFeaturePlot_merged.pdf", p, width = 12, height = 6);p
+```
+
+```{r}
+save(stRNA,stolist,file = './data/stRNA_stolist_reduction.Rdata')
+rm(list = ls())
+gc()
+```
+## 1.3 markers
+```{r}
+{
+library("Nebulosa")
+library("Seurat")
+library("BiocFileCache")
+}
+load("./data/stRNA_stolist_reduction.Rdata")
+FeaturePlot(stRNA, reduction = "umap",features=c("Gdf9", "Amhr2","Tcf21","Des","Cdh5","Krt19","Ptprc","Ptgfr"),ncol = 4 )
+```
+```{r}
+p <-plot_density(stRNA, c("Gdf9", "Amhr2","Tcf21","Des","Cdh5","Krt19","Ptprc","Ptgfr")) 
+
+p1 <- p+plot_layout(ncol = 4)
+p1
+```
+```{r}
+#绘制 Marker 基因的 SpatialPlot 图；
+p <-SpatialPlot(stRNA,features="Enpp2",
+            image.alpha = 1,
+            crop = TRUE,
+            cols.highlight = c("#DE2D26", "grey50"),
+            label.size = 5,
+            pt.size.factor = 1.6,
+            alpha = c(1, 1),
+            stroke = 0.25,
+            label.box = TRUE)
+p
+```
+```{r}
+features = c("Enpp2", "Gdf9","Amhr2","Des","Lyz2","Inha","Inhbb","Cyp19a1","Cyp11a1","Cd68","Wt1","Slc38a3","Wnt6","Lpar6","Prss23",'Hsd17b1','Ptgfr','Sfrp4','Lum','Cyp17a1','Enpep','Aldh1a2','Tcf21','Star','Ptgs2','Plin2')
+#绘制 Marker 基因的 SpatialFeaturePlot 图；        
+p = SpatialFeaturePlot(stRNA,features="Enpp2", alpha = c(0.1, 1));p
+ggsave("./figure/markers/Enpp2-SpatialFeaturePlot_merged.pdf", p, width = 7, height = 4.5)
+
+```
+
+```{r}
+#(1) 亚群间差异基因分析,同时分析所有亚群的marker基因
+dif<-FindAllMarkers(stRNA,only.pos = FALSE, 
+                    min.pct = 0.25, 
+                    logfc.threshold = 0.25,
+                    test.use = "wilcox")
+write.csv(dif,"./files/dif_between_ST0_9.csv")
+
+#logfc.threshold定义上调倍数阈值，min.pct定义基因至少在细胞亚群中多少细胞中表达，only.pos确定只筛选上调基因
+
+#通过dplyr包来完成对top基因的筛选
+sig.dif<-dif%>%
+  group_by(cluster)%>%
+  top_n(n = 5,wt = avg_log2FC)
+#保存差异分析结果
+write.table(sig.dif,"./files/sig_dif_top5.xls",row.names = T,col.names = T,quote = F,sep = "\t")
+
+
+##单独两个或多个亚群比较分析marker基因分析
+# markers <- FindMarkers(stRNA, ident.1 = 3, ident.2 = 9)
+
+##绘制每个亚群top5差异基因热图
+{
+##美化热图
+library(RColorBrewer)
+  mycolor = c("#A0C2E7",
+                   "#6894B9",
+                   "#8798A6",
+                   "#E0D9E0",
+                   "#EDBAA7",
+                   "#FADB7F",
+                   "#F3B646",
+                   "#EF9749",
+                   "#B27466",
+                   "#646F3F",
+                   "#899678",
+                   "#C2BC9A",
+                   "#868A63",
+                   "#C4C3BE",
+                   "#DFA0A6",
+                   "#98B3D9",
+                   "#E4BE92",
+                   "#CB6B7A",
+                   "#D5CBDA",
+                   "#f1707d", # 马卡龙草莓奶霜
+                   "#f15536",
+                   "#ef5767",
+                   "#ae716e",
+                   "#cb8e85",
+                   "#cf8878",
+                   "#c86f67",
+                   "#f1ccb8",
+                   "#f2debd",
+                   "#b8d38f",
+                   "#ddff95",
+                   "#ff9b6a",
+                   "#f1b8f1",
+                   "#d9b8f1",
+                   "#f1ccb8",
+                   "#f1f1b8",
+                   "#b8f1ed",
+                   "#e7dbca",
+                   "#e26538",
+                   "#f3d751",
+                   "#fd803a",
+                   "#fe997b",
+                   "#c490a0"
+)
+mypalette <- brewer.pal(n = 9, name = "YlOrRd")
+p6 <- DoHeatmap(stRNA,
+          features = as.character(unique(sig.dif$gene)),
+          group.by = "opt_clust",
+          group.colors =mycolor)+
+  scale_fill_gradientn(colors = c("white","grey90","firebrick3"))
+
+ggsave("./figure/markers/Top5DEG_seurat_cluster_heatmap.pdf", p6, width = 12, height = 9)
+}
+```
+
+```{r}
+p6
+```
+
+
+```{r}
+##做不同ST cluster的火山图
+dif$label <- ifelse(dif$p_val<0.05,"adjust P-val<0.05","adjust P-val>=0.05") 
+filtered_dif <- dif[dif$p_val < 0.05&abs(dif$avg_log2FC) >1,]
+dim(filtered_dif)
+#[1] 3082    8
+```
+```{r}
+topgene = sig.dif
+{
+p <- ggplot()+
+  geom_jitter(data = dif,
+              aes(x = cluster, y = avg_log2FC,color=label),
+              size = 0.5,
+              width =0.4)+
+  geom_jitter(data = topgene,
+              aes(x = cluster, y = avg_log2FC),
+              size = 1,
+              width =0.4)
+
+#根据图p中log2FC区间确定背景柱长度：
+dfbar<-data.frame(x=c("0","1","2","3","4","5","6","7","8","9"),
+                  y=c(1.8,5.3,5,4.2,2.5,2.1,2.1,5,5,4))
+dfbar1<-data.frame(x=c("0","1","2","3","4","5","6","7","8","9"),
+                   y=c(-3,-2.8,-3.1,-3.2,-3,-2,-2.5,-3.2,-3,-1.5))
+#绘制背景柱：
+p1 <- ggplot()+
+  geom_col(data = dfbar,
+           mapping = aes(x = x,y = y),
+           fill = "#dcdcdc",alpha = 0.5)+
+  geom_col(data = dfbar1,
+           mapping = aes(x = x,y = y),
+           fill = "#dcdcdc",alpha = 0.5)
+
+#添加X轴的cluster色块标签：
+dfcol<-data.frame(x=c("0","1","2","3","4","5","6","7","8","9"),
+                  y=0,
+                  label=c("0","1","2","3","4","5","6","7","8","9"))
+
+p <- ggplot()+
+  geom_col(data = dfbar,
+           mapping = aes(x = x,y = y),
+           fill = "#dcdcdc",alpha = 0.5)+
+  geom_col(data = dfbar1,
+           mapping = aes(x = x,y = y),
+           fill = "#dcdcdc",alpha = 0.5)+
+  geom_jitter(data = dif,
+              aes(x = cluster, y = avg_log2FC,color=label),
+              size = 0.4,
+              width =0.4)+
+  geom_jitter(data = topgene,
+              aes(x = cluster, y = avg_log2FC),
+              size = 0.8,
+              width =0.4)+
+  geom_tile(data = dfcol,
+            aes(x=x,y=y),
+            height=0.8,
+            color = "black",
+            fill = mycolor[1:10],
+            alpha = 0.6,
+            show.legend = F)
+
+library(ggrepel)
+#给每个Cluster差异表达前Top5基因加上标签：
+p2 <- p + geom_tile(data = dfcol,
+                     aes(x=x,y=y),
+                     height=0.8,
+                     color = "black",
+                     fill = mycolor[1:10],
+                     alpha = 0.6,
+                     show.legend = F)+
+  geom_text_repel(
+    data=topgene,
+    aes(x=cluster,y=avg_log2FC,label=gene),
+    size =3,
+    arrow = arrow(length = unit(0.008, "npc"),
+                  type = "open", ends = "last")
+  )
+
+
+p2 <- p2 +
+  scale_color_manual(name=NULL,
+                     values = c("#f8766d","grey20"))
+
+
+
+
+
+p2 <- p2+
+  labs(x="Cluster",y="avg_log2FC")+
+  geom_text(data=dfcol,
+            aes(x=x,y=y,label=label),
+            size =3,
+            color ="white")
+
+
+
+p2 <- p2 +
+  geom_text(data=dfcol,
+            aes(x=x,y=y,label=label),
+            size =4,
+            color ="white")+
+  theme_minimal()+
+  theme(
+    axis.title = element_text(size = 12,
+                              color = "black",
+                              face = "bold"),
+    axis.line.y = element_line(color = "black",
+                               size = 0.8),
+    axis.line.x = element_blank(),
+    axis.text.x = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "top",
+    legend.direction = "vertical",
+    legend.justification = c(1,0),
+    legend.text = element_text(size = 12)
+  )
+
+ggsave("./figure/markers/Volcano_DEG_Cluster0_9.pdf",p2,width = 12,height = 8)
+}
+p2
+```
+```{r}
+{
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+}
+if(T){
+  DefaultAssay(stRNA) <- "SCT"
+  markerlist <- list(
+    Immune  = c("Cd68","Lyz2", "Cd14","Ptprc","Adgre1","Cd74","Ctss","C1qb","C1qc","Cd52"),
+    GC = c("Amhr2","Amh","Foxl2","Kitl","Cyp19a1","Gata4","Fshr","Inha","Inhbb","Nr5a2"),
+    Oocytes = c("Ddx4","Gdf9","Bmp15","Dazl","Zp3","Ooep","Tcl1","Hlfoo","Gm15698","Padi6"),
+    Fibroblast = c("Tcf21","Dcn","Col1a1","Tenm4","Htra3","Igfbp4","Mfap4","Enpp2","Gatm","Fzd1"),
+    Luteal = c("Neat1","Sfrp4","Prlr","Ptgfr","Plin4","Col3a1","Igfbp7","Sgk1","Lgmn","Efhd1"),
+    Theca = c("Serpina5","Hsd17b1","Star","Cyp11a1","Cyp17a1","Fdx1","Hao2","Mgarp","Acsbg1","Dnajc15"),
+    SMA = c("Des","Acta2","My19","Cnn1","Actg2","Tns","Pln","Mfap5","Tagln","Ednrb"),
+    Epithelial = c("Epcam", "Cdh1","Cd24a","Krt19","Upk1b","Upk3b","Mt2","Krt18","Lgals7","Aldhla2"),
+    Endothelial = c("Pecam1", "Vwf","Cd34","Cdh5","Kdr","Mmrn2","Esam","Flt1","Egfl7","Cldn5"),
+    Cumulus =c("Grb14","Prss23","Amh","Lhcgr","Has2","Ptx3","Ptgs2","Cx43","S100a6","Tnc")
+    )
+  dir_selected = file.path("figure","markers")
+  for(i in names(markerlist)){
+    markers <- markerlist[[i]]
+    p <- SpatialFeaturePlot(stRNA, features = markers,ncol = 4) + plot_layout()&theme(legend.position = "right")
+    ggsave(file.path(dir_selected,paste0(i, ".pdf")), p, width = 10, height = 8)
+  }
+  markers <- do.call("c",markerlist)
+  # p <- SpatialFeaturePlot(stRNA, features = markers, images = "CTR", ncol = 4) + plot_layout()&theme(legend.position = "right")
+  # ggsave("Markers_CTR1.pdf", p, width = 18, height = 30)
+  # 
+  # p <- SpatialFeaturePlot(stRNA, features = markers, images = "Cancer", ncol = 4) + plot_layout()&theme(legend.position = "right")
+  # ggsave("Markers_LIP2.pdf", p, width = 18, height = 30)
+  
+}
+```
+
+```{r}
+  table(stRNA$orig.ident)
+ # CTR Lip 
+ # 379 382
+```
+```{r}
+prop.table(table(Idents(stRNA)))
+table(Idents(stRNA), stRNA$orig.ident)
+```
+
+
+```{r}
+
+```
+
